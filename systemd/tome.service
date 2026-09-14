@@ -1,0 +1,20 @@
+[Unit]
+Description=Tome — Local Search Daemon
+After=local-fs.target
+
+[Service]
+Type=simple
+User=juxtapo
+WorkingDirectory=/mnt/playground/Server_files/tome
+ExecStartPre=/usr/bin/mkdir -p /mnt/playground/Server_files/tome/runtime
+ExecStartPre=/usr/bin/rm -f /mnt/playground/Server_files/tome/runtime/tome.sock
+ExecStart=/mnt/playground/Server_files/tome/target/release/tome daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tome
+
+[Install]
+WantedBy=multi-user.target

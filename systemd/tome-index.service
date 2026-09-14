@@ -1,0 +1,14 @@
+[Unit]
+Description=Tome — Incremental Index Refresh
+After=tome.service
+Requires=tome.service
+
+[Service]
+Type=oneshot
+User=juxtapo
+PermissionsStartOnly=true
+WorkingDirectory=/mnt/playground/Server_files/tome
+ExecStart=/usr/local/bin/tome index --incremental --config /mnt/playground/Server_files/nudger/mata/config_linux.json
+ExecStartPost=/bin/systemctl reload tome.service
+StandardOutput=journal
+StandardError=journal

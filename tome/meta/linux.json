@@ -1,0 +1,15 @@
+{
+  "source": "linux",
+  "document_count": 1036353,
+  "imported_at": 1786373404.3501182,
+  "source_db_path": null,
+  "source_db_mtime": null,
+  "roots": [
+    "/home/juxtapo",
+    "/root/Opus",
+    "/root/.claude"
+  ],
+  "mode": "incremental",
+  "config_path": "/mnt/playground/Server_files/nudger/mata/config_linux.json",
+  "schema_version": 1
+}

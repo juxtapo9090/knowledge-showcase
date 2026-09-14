@@ -1,0 +1,11 @@
+[Unit]
+Description=Tome — Periodic Index Refresh
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=6h
+Persistent=true
+Unit=tome-index.service
+
+[Install]
+WantedBy=timers.target

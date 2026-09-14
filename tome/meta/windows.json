@@ -1,0 +1,13 @@
+{
+  "source": "windows",
+  "document_count": 2639327,
+  "imported_at": 1774315590.2826722,
+  "source_db_path": null,
+  "source_db_mtime": null,
+  "roots": [
+    "/run/media/juxtapo/B256A9D956A99F1B"
+  ],
+  "mode": "reindex",
+  "config_path": "/home/juxtapo/Server_files/nudger/mata/config.json",
+  "schema_version": 1
+}

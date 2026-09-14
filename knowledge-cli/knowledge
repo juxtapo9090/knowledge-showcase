@@ -1,0 +1,311 @@
+#!/bin/bash
+# knowledge — Ask Mata directly 👁️
+# Tantivy engine (via tome) on hot paths, SQLite fallback for niche queries.
+
+DB="/home/juxtapo/Server_files/nudger/mata/mata_linux.db"
+
+usage() {
+  cat <<'EOF'
+knowledge — Ask Mata directly 👁️  (Tantivy-backed)
+
+Usage:
+  knowledge <query>              Search file contents
+  knowledge -f <name>            Find by filename
+  knowledge -e .py <query>       Filter by extension
+  knowledge -e .py -f <name>     Filter by extension + filename
+  knowledge -s                   Index stats
+  knowledge -r [n]               Recent files (default 20)
+  knowledge -d <dir>             List indexed files in directory
+  knowledge --breadcrumb <name>  Find file + show header (hook-friendly)
+  knowledge --warp <name>        Find file + interactive pick + cd path
+  knowledge --reindex            Trigger re-index (Linux, via Tome rebuild + reload)
+  knowledge --reindex-win        Rebuild Windows index (from NTFS mount)
+  knowledge --win <query>        Search Windows index
+  knowledge --win -f <name>      Find filename in Windows index
+  knowledge grep <grep-args...>  Live 1:1 grep replacement (forwards to rg)
+
+Examples:
+  knowledge jaga_brain
+  knowledge -f "wolf"
+  knowledge -e .md constellation
+  knowledge -r 10
+  knowledge -d /root/Opus/Pool
+  knowledge --breadcrumb mercury.py
+  knowledge --warp gabriel.py
+  knowledge grep -rln -i -F -e "claude --resume" -e "cd /root/Opus" /home/juxtapo /etc
+EOF
+  exit 0
+}
+
+[ $# -eq 0 ] && usage
+
+# ── grep passthrough — the 1:1 live-scan escape hatch ──
+# knowledge's own search is a Tantivy INDEX (last import can be hours stale —
+# see `knowledge -s`), so it can never be a true grep replacement: regex,
+# multiple -e patterns, -i/-v/-A/-B/-C, multi-root scans, and freshly-written
+# files are all outside what an index can answer. Rather than half-fake those
+# flags against Tantivy, `knowledge grep ...` is a dedicated subcommand
+# (checked before the option parser below, so it can never collide with
+# knowledge's own -r/-e/-f, which already mean "recent"/"extension"/"find")
+# that forwards verbatim to `rg` — live, real, and per house policy already
+# the accepted grep alternative for big trees (CLAUDE.md: "or rg if you must").
+# One exception: -r and -E are DROPPED before forwarding. rg recurses by
+# default (no flag needed) and treats -r as --replace (a different feature
+# entirely — passing grep's -r through would silently misfire, not error).
+# -E (extended regex) is meaningless to rg too: its regex engine already
+# behaves like extended/PCRE-ish by default, no opt-in flag exists. Every
+# other grep flag (-i -v -F -l -n -A -B -C -e, multiple patterns, multiple
+# paths) rg already accepts natively — no translation needed. Bundled short
+# flags (grep's classic `-rln` = -r -l -n combined) are unbundled: strip just
+# the r/E letters out of the cluster, keep the rest — dropping the whole
+# token would silently eat -l/-n too, and NOT unbundling would leave a live
+# "-r" hiding inside "-rln", which is exactly the bug this whole guard exists
+# to prevent.
+if [[ "$1" == "grep" ]]; then
+  shift
+  ARGS=()
+  for a in "$@"; do
+    if [[ "$a" == "-r" || "$a" == "-E" ]]; then
+      continue
+    elif [[ "$a" =~ ^-[a-zA-Z]+$ ]]; then
+      stripped="${a//r/}"
+      stripped="${stripped//E/}"
+      [[ "$stripped" == "-" ]] && continue
+      ARGS+=("$stripped")
+    else
+      ARGS+=("$a")
+    fi
+  done
+  if command -v rg &>/dev/null; then
+    exec rg --color=never "${ARGS[@]}"
+  else
+    exec /usr/bin/grep -r "$@"
+  fi
+fi
+
+EXT=""
+MODE="search"
+LIMIT=20
+QUERY=""
+SOURCE="linux"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage ;;
+    -f) MODE="find"; shift; QUERY="$1"; shift ;;
+    -e) shift; EXT="$1"; shift ;;
+    -s) MODE="stats"; shift ;;
+    -r) MODE="recent"; shift; [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]] && LIMIT="$1" && shift ;;
+    -d) MODE="dir"; shift; QUERY="$1"; shift ;;
+    --breadcrumb) MODE="breadcrumb"; shift; QUERY="$1"; shift ;;
+    --warp) MODE="warp"; shift; QUERY="$1"; shift ;;
+    --reindex)
+      CONFIG="/home/juxtapo/Server_files/nudger/mata/config_linux.json"
+      if ! tome index --reindex --config "$CONFIG"; then
+        echo "❌ Reindex failed"
+        exit 1
+      fi
+
+      if /usr/bin/systemctl is-active --quiet tome.service; then
+        if ! /usr/bin/sudo -n /usr/bin/systemctl reload tome.service; then
+          echo "⚠️ Tome reindexed, but systemd reload failed"
+          exit 1
+        fi
+      else
+        echo "⚠️ Tome service was not running; starting it..."
+        if ! /usr/bin/sudo -n /usr/bin/systemctl start tome.service; then
+          echo "⚠️ Tome reindexed, but systemd start failed"
+          exit 1
+        fi
+      fi
+
+      for _ in {1..20}; do
+        if tome status --json 2>/dev/null | jq -e '.daemon_reachable == true' >/dev/null 2>&1; then
+          echo "✅ Tome reindexed + reloaded"
+          exit 0
+        fi
+        sleep 0.5
+      done
+      echo "⚠️ Tome reindexed, but daemon did not come back in time"
+      exit 1
+      ;;
+    --reindex-win)
+      NTFS_MOUNT="/run/media/juxtapo/B256A9D956A99F1B"
+      if [[ ! -d "$NTFS_MOUNT" ]]; then
+        echo "❌ Windows partition not mounted at $NTFS_MOUNT"
+        exit 1
+      fi
+      echo "🔄 Rebuilding Windows index from NTFS mount..."
+      echo "   Using Tome direct crawl (no mata.py needed)"
+      tome index --source windows --root "$NTFS_MOUNT/" --reindex
+      echo "✅ Windows index rebuilt"
+      exit 0 ;;
+    --win) SOURCE="windows"; shift ;;
+    *) QUERY="$1"; shift ;;
+  esac
+done
+
+# ── helpers ──
+
+fmt_size() {
+  local b=$1
+  if (( b < 1024 )); then printf "%dB" "$b"
+  elif (( b < 1048576 )); then printf "%d.%dK" "$((b / 1024))" "$(( (b % 1024) * 10 / 1024 ))"
+  else printf "%d.%dM" "$((b / 1048576))" "$(( (b % 1048576) * 10 / 1048576 ))"
+  fi
+}
+
+fmt_time() {
+  date -d "@$1" "+%Y-%m-%d %H:%M" 2>/dev/null
+}
+
+print_row() {
+  local path="$1" size="$2" mod="$3"
+  printf "  %6s  %s  %s\n" "$(fmt_size "$size")" "$(fmt_time "$mod")" "$path"
+}
+
+# ── tome args builder ──
+
+tome_args() {
+  local cmd="$1" query="$2" limit="$3"
+  local args=("$cmd" "$query" --json --limit "$limit")
+  [[ -n "$EXT" ]] && args+=(-e "$EXT")
+  echo "${args[@]}"
+}
+
+# ── stats ──
+
+if [[ "$MODE" == "stats" ]]; then
+  json=$(tome status --json 2>/dev/null)
+  if [[ $? -eq 0 && -n "$json" ]]; then
+    linux_docs=$(echo "$json" | jq -r '.loaded_sources[] | select(.source=="linux") | .document_count')
+    imported=$(echo "$json" | jq -r '.loaded_sources[] | select(.source=="linux") | .imported_at')
+    uptime=$(echo "$json" | jq -r '.uptime_seconds')
+    echo "👁️ Mata Index: $(printf "%'d" "$linux_docs") files"
+    echo "📅 Last import: $(fmt_time "${imported%%.*}")"
+    echo "⚡ Tome uptime: ${uptime}s"
+    # Extension breakdown — live from tome/Tantivy (SQLite mirror froze 2026-03-22)
+    echo ""
+    tome ext --limit 15 2>/dev/null || echo "  (ext breakdown unavailable)"
+  else
+    echo "❌ Tome daemon not reachable — try: tome daemon"
+  fi
+
+# ── search (content) ──
+
+elif [[ "$MODE" == "search" ]]; then
+  json=$(tome search "$QUERY" --json --limit "$LIMIT" --source "$SOURCE" ${EXT:+-e "$EXT"} 2>/dev/null)
+  if [[ $? -eq 0 && -n "$json" ]]; then
+    total=$(echo "$json" | jq -r '.total')
+    elapsed=$(echo "$json" | jq -r '.elapsed_ms')
+    echo "👁️ ${total} match(es) for '${QUERY}'${EXT:+  [$EXT]}  (${elapsed}ms)"
+    echo ""
+    echo "$json" | jq -r '.results[] | [.path, (.size_bytes|tostring), (.modified_at|tostring), (.snippet // "")] | @tsv' | \
+    while IFS=$'\t' read -r path size mod snippet; do
+      mod_int="${mod%%.*}"
+      print_row "$path" "${size%%.*}" "$mod_int"
+      [[ -n "$snippet" ]] && printf "         %s\n" "${snippet:0:120}"
+    done
+  else
+    echo "❌ Tome search failed — daemon running? try: tome daemon"
+  fi
+
+# ── find (filename) ──
+
+elif [[ "$MODE" == "find" ]]; then
+  json=$(tome find "$QUERY" --json --limit "$LIMIT" --source "$SOURCE" ${EXT:+-e "$EXT"} 2>/dev/null)
+  if [[ $? -eq 0 && -n "$json" ]]; then
+    total=$(echo "$json" | jq -r '.total')
+    elapsed=$(echo "$json" | jq -r '.elapsed_ms')
+    echo "👁️ ${total} file(s) matching '${QUERY}'${EXT:+  [$EXT]}  (${elapsed}ms)"
+    echo ""
+    echo "$json" | jq -r '.results[] | [.path, (.size_bytes|tostring), (.modified_at|tostring)] | @tsv' | \
+    while IFS=$'\t' read -r path size mod; do
+      mod_int="${mod%%.*}"
+      print_row "$path" "${size%%.*}" "$mod_int"
+    done
+  else
+    echo "❌ Tome find failed — daemon running? try: tome daemon"
+  fi
+
+# ── breadcrumb (find + show header) ──
+
+elif [[ "$MODE" == "breadcrumb" ]]; then
+  json=$(tome find "$QUERY" --json --limit 5 --source "$SOURCE" 2>/dev/null)
+  if [[ $? -ne 0 || -z "$json" ]]; then
+    echo "📌 No files matching '${QUERY}'"
+    exit 0
+  fi
+  count=$(echo "$json" | jq -r '.results | length')
+  if [[ "$count" -eq 0 ]]; then
+    echo "📌 No files matching '${QUERY}'"
+    exit 0
+  fi
+  echo "$json" | jq -r '.results[] | [.path, (.size_bytes|tostring), (.modified_at|tostring)] | @tsv' | \
+  while IFS=$'\t' read -r path size mod; do
+    mod_int="${mod%%.*}"
+    echo "📌 $path"
+    printf "   [%s · %s]\n" "$(fmt_size "${size%%.*}")" "$(fmt_time "$mod_int")"
+    if [[ -r "$path" ]]; then
+      head -15 "$path" 2>/dev/null | while IFS= read -r line; do
+        printf "   %s\n" "${line:0:120}"
+      done
+    else
+      echo "   ⚠️ Cannot read file"
+    fi
+    echo ""
+  done
+
+# ── warp (find + interactive pick + cd path) ──
+
+elif [[ "$MODE" == "warp" ]]; then
+  json=$(tome find "$QUERY" --json --limit 10 --source "$SOURCE" 2>/dev/null)
+  if [[ $? -ne 0 || -z "$json" ]]; then
+    echo "❌ No files matching '${QUERY}'"
+    exit 1
+  fi
+  count=$(echo "$json" | jq -r '.results | length')
+  if [[ "$count" -eq 0 ]]; then
+    echo "❌ No files matching '${QUERY}'"
+    exit 1
+  elif [[ "$count" -eq 1 ]]; then
+    echo "$json" | jq -r '.results[0].path' | xargs dirname
+  else
+    echo "📍 ${count} matches for '${QUERY}':" >&2
+    echo "$json" | jq -r '.results[] | .path' | nl -ba >&2
+    printf "\nPick [1-%s]: " "$count" >&2
+    read -r choice < /dev/tty
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
+      echo "$json" | jq -r ".results[$((choice-1))].path" | xargs dirname
+    else
+      echo "❌ Invalid choice" >&2
+    fi
+  fi
+
+# ── recent (tome/Tantivy — sorted by modified_at via FAST field) ──
+
+elif [[ "$MODE" == "recent" ]]; then
+  json=$(tome recent --json --limit "$LIMIT" --source "$SOURCE" 2>/dev/null)
+  if [[ $? -eq 0 && -n "$json" ]]; then
+    total=$(echo "$json" | jq -r '.total')
+    echo "👁️ ${total} most recent file(s)"
+    echo ""
+    echo "$json" | jq -r '.results[] | [.path, (.size_bytes|tostring), (.modified_at|tostring)] | @tsv' | \
+    while IFS=$'\t' read -r path size mod; do
+      print_row "$path" "${size%%.*}" "${mod%%.*}"
+    done
+  else
+    echo "❌ Tome recent failed — index built? try: knowledge --reindex"
+  fi
+
+# ── dir (live filesystem walk — SQLite mirror froze 2026-03-22) ──
+
+elif [[ "$MODE" == "dir" ]]; then
+  if [[ ! -d "$QUERY" ]]; then echo "❌ Not a directory: $QUERY" && exit 1; fi
+  mapfile -t _rows < <(find "$QUERY" -type f -printf '%s\t%T@\t%p\n' 2>/dev/null | sort -t$'\t' -k3 | head -100)
+  printf '👁️ %d file(s) in %s  (live · max 100)\n\n' "${#_rows[@]}" "$QUERY"
+  for _r in "${_rows[@]}"; do
+    IFS=$'\t' read -r _sz _mt _pp <<< "$_r"
+    print_row "$_pp" "$_sz" "${_mt%%.*}"
+  done
+fi
